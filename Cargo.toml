@@ -10,18 +10,7 @@ cortex-m = "0.5.8"
 cortex-m-rt = "0.6.5"
 cortex-m-semihosting = "0.3.2"
 panic-halt = "0.2.0"
-# stm32f103xx = "0.8.1"
 
-# Uncomment for the panic example.
-# panic-itm = "0.4.0"
-
-# Uncomment for the allocator example.
-# alloc-cortex-m = "0.3.5"
-
-# Uncomment for the device example.
-# [dependencies.stm32f30x]
-# features = ["rt"]
-# version = "0.7.1"
 [dependencies.stm32f1]
 features = ["stm32f103", "rt"]
 version = "0.4.0"
