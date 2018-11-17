@@ -74,9 +74,13 @@ fn main() -> ! {
                       .dff().bit(true)
                       .mstr().bit(true)
                       .ssm().bit(true)
-                      .ssi().bit(true)
-                      .rxonly().bit(true));
+                      .cpol().bit(true)
+                      .cpha().bit(false)
+                      // .rxonly().bit(true)
+                      .ssi().bit(true));
     }
+    spi.cr1.modify(|_, w| w
+                   .spe().bit(true));
 
     // spi.cr2.write(|w| w.rxneie().bit(true));
 
@@ -126,13 +130,20 @@ fn fetch_snes_controller_state(spi: &mut stm32f103::SPI1, gpio: &mut stm32f103::
     delay_us(12);
     gpio.odr.modify(|_, w| w.odr5().bit(false));
 
-    // enable spi to trigger a transfer
-    spi.cr1.modify(|_, w| w.spe().bit(true));
-    // wait for the rx complete interrupt to fire
-    // cortex_m::asm::wfi();
+    // // enable spi to trigger a transfer
+    // spi.cr1.modify(|_, w| w.spe().bit(true));
+    // // wait for the rx complete interrupt to fire
+    // // cortex_m::asm::wfi();
+    // while spi.sr.read().rxne().bit_is_clear() { }
+    // // disable the spi transfer before we fetch data to avoid triggering another
+    // spi.cr1.modify(|_, w| w.spe().bit(false));
+    // // grab the data out of the DR
+    // spi.dr.read().dr().bits()
+
+    // write a nonsense byte to tx to trigger a transfer
+    unsafe { spi.dr.write(|w| w.dr().bits(0xff)); }
+    // wait for some fresh rx data
     while spi.sr.read().rxne().bit_is_clear() { }
-    // disable the spi transfer before we fetch data to avoid triggering another
-    spi.cr1.modify(|_, w| w.spe().bit(false));
     // grab the data out of the DR
     spi.dr.read().dr().bits()
 }
