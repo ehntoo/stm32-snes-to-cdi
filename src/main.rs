@@ -116,6 +116,7 @@ fn main() -> ! {
     exti.imr.modify(|_, w| w.mr7().bit(true));
     // enable rising edge irq for exti7
     exti.rtsr.modify(|_, w| w.tr7().bit(true));
+    exti.ftsr.modify(|_, w| w.tr7().bit(true));
 
     // enable the uart transmit
     uart.cr1.write(|w| w
@@ -136,8 +137,14 @@ fn main() -> ! {
 
     loop {
         if unsafe {WAKEUP_SOURCE == WakeSource::CdiRts} {
-            exti.pr.write(|w| w.pr7().bit(true));
+            // did we see rts falling edge? if so, we need to shut up until it goes high
+            if gpio_b.idr.read().idr7().bit_is_clear() {
+                // wait for a rising edge
+                syst.disable_interrupt();
+                cortex_m::asm::wfi();
+            }
             send_controller_type(&mut uart);
+            syst.enable_interrupt();
         } else {
             // refresh snes data
             let new_snes_data = fetch_snes_controller_state(&mut spi, &mut gpio_b);
