@@ -9,6 +9,25 @@ use cortex_m::peripheral::syst::SystClkSource;
 use stm32f1::stm32f103;
 use stm32f1::interrupt;
 
+#[macro_use]
+extern crate bitflags;
+bitflags! {
+    struct SnesState: u16 {
+        const B      = 0x001;
+        const Y      = 0x002;
+        const Select = 0x004;
+        const Start  = 0x008;
+        const Up     = 0x010;
+        const Down   = 0x020;
+        const Left   = 0x040;
+        const Right  = 0x080;
+        const A      = 0x100;
+        const X      = 0x200;
+        const L_B    = 0x400;
+        const R_B    = 0x800;
+    }
+}
+
 const CONTROLLER_TYPE_ID: u16 = 0x4a;
 
 #[derive(PartialEq)]
@@ -16,8 +35,6 @@ enum WakeSource {
     NoWake,
     SysTick,
     CdiRts,
-    _SpiRxComplete,
-    _UartTxComplete,
 }
 
 static mut WAKEUP_SOURCE: WakeSource = WakeSource::NoWake;
@@ -45,22 +62,29 @@ fn main() -> ! {
                        .afioen().bit(true)
                        .usart1en().bit(true));
 
-    // use port b for usart1/spi1
-    afio.mapr.modify(|_, w| w
-                     .usart1_remap().bit(true)
-                     .spi1_remap().bit(true));
-
     unsafe {
+        afio.mapr.modify(|_, w| w
+                        // Remap (TX/PB6, RX/PB7)
+                        .usart1_remap().bit(true)
+                        // disable jtag (but not swd) so we can use spi remap
+                        .swj_cfg().bits(0b010)
+                        // Remap (NSS/PA15, SCK/PB3, MISO/PB4, MOSI/PB5)
+                        .spi1_remap().bit(true));
+
         gpio_b.crl.modify(|_, w| w
                           // set PB3 (clock) and PB6 (uart tx) as 2MHz push-pull AF outputs
                           .cnf3().bits(0b10)
-                          .mode3().bits(0b10)
+                          .mode3().bits(0b11)
                           .cnf6().bits(0b10)
-                          .mode6().bits(0b10)
+                          .mode6().bits(0b11)
+
+                          // set PB4 (data) as input
+                          .cnf4().bits(0b01)
+                          .mode4().bits(0b00)
 
                           // set pb5 (latch) as 2MHz push-pull output
                           .cnf5().bits(0b00)
-                          .mode5().bits(0b10));
+                          .mode5().bits(0b11));
 
         // want USARTDIV to be 52.08 = 8mhz/16/9600
         // fraction is in 16ths, so 52.0625 is what we end up with
@@ -68,27 +92,22 @@ fn main() -> ! {
                        .div_mantissa().bits(52)
                        .div_fraction().bits(1));
 
-        spi.cr1.write(|w| w
+        spi.cr1.modify(|_, w| w
                       // pclk/128 -> 8mhz/128 ~= 62.5kHz
                       .br().bits(0b110)
                       .dff().bit(true)
                       .mstr().bit(true)
                       .ssm().bit(true)
+                      .lsbfirst().bit(true)
+                      .ssi().bit(true)
+                      .spe().bit(true)
                       .cpol().bit(true)
-                      .cpha().bit(false)
-                      // .rxonly().bit(true)
-                      .ssi().bit(true));
+                      .cpha().bit(false));
     }
-    spi.cr1.modify(|_, w| w
-                   .spe().bit(true));
-
-    // spi.cr2.write(|w| w.rxneie().bit(true));
 
     // enable the uart transmit
     uart.cr1.write(|w| w
                    .ue().bit(true)
-                   // TODO - WFI during char transmission rather than polling?
-                   //.tcie().bit(true)
                    .te().bit(true));
 
     // TODO configure falling edge interrupt on RTS
@@ -103,13 +122,11 @@ fn main() -> ! {
     syst.enable_interrupt();
 
     loop {
-        // TODO - check if the wakeup cause was the CDI requesting ident or a systick
         if unsafe {WAKEUP_SOURCE == WakeSource::CdiRts} {
             send_controller_type(&mut uart);
         } else {
             // refresh snes data
             let new_snes_data = fetch_snes_controller_state(&mut spi, &mut gpio_b);
-            tx_serial_byte(&mut uart, new_snes_data + 0x30);
 
             // transmit a full data packet iff the snes data changed
             if last_snes_data != new_snes_data {
@@ -130,22 +147,20 @@ fn fetch_snes_controller_state(spi: &mut stm32f103::SPI1, gpio: &mut stm32f103::
     delay_us(12);
     gpio.odr.modify(|_, w| w.odr5().bit(false));
 
-    // // enable spi to trigger a transfer
-    // spi.cr1.modify(|_, w| w.spe().bit(true));
-    // // wait for the rx complete interrupt to fire
-    // // cortex_m::asm::wfi();
-    // while spi.sr.read().rxne().bit_is_clear() { }
-    // // disable the spi transfer before we fetch data to avoid triggering another
-    // spi.cr1.modify(|_, w| w.spe().bit(false));
-    // // grab the data out of the DR
-    // spi.dr.read().dr().bits()
-
     // write a nonsense byte to tx to trigger a transfer
-    unsafe { spi.dr.write(|w| w.dr().bits(0xff)); }
+    unsafe { spi.dr.write(|w| w.dr().bits(0x55aa)); }
     // wait for some fresh rx data
     while spi.sr.read().rxne().bit_is_clear() { }
-    // grab the data out of the DR
-    spi.dr.read().dr().bits()
+    // grab the data out of the DR and invert it
+    (!spi.dr.read().dr().bits()) & 0xfff
+}
+
+fn nybble_to_hex(nybble: u16) -> u16 {
+    if nybble > 9 {
+        (nybble + 0x41 - 10) as u16
+    } else {
+        (nybble + 0x30) as u16
+    }
 }
 
 fn tx_serial_byte(uart: &mut stm32f103::USART1, byte: u16) {
@@ -157,16 +172,18 @@ fn send_controller_type(uart: &mut stm32f103::USART1) {
     tx_serial_byte(uart, CONTROLLER_TYPE_ID);
 }
 
-fn tx_controller_state(_controller_state: u16, uart: &mut stm32f103::USART1) {
+fn tx_controller_state(controller_state: u16, uart: &mut stm32f103::USART1) {
     // TODO: manipulate data for transmit
-    tx_serial_byte(uart, 0x41);
-    tx_serial_byte(uart, 0x42);
-    tx_serial_byte(uart, 0x43);
+    tx_serial_byte(uart, nybble_to_hex((controller_state & 0xf00) >> 8));
+    tx_serial_byte(uart, nybble_to_hex((controller_state & 0xf0) >> 4));
+    tx_serial_byte(uart, nybble_to_hex((controller_state & 0xf) >> 0));
+    tx_serial_byte(uart, 0x0d);
+    tx_serial_byte(uart, 0x0a);
 }
 
 fn delay_us(us: u16) {
-    const K: u16 = 3; // this value needs to be tweaked
-    for _ in 0..(K * us) {
+    // this works out about right at 8mhz in release mode
+    for _ in 0..(3 * us / 2) {
         cortex_m::asm::nop()
     }
 }
@@ -176,11 +193,6 @@ fn SysTick() {
     // wake up to grab the latest SNES inputs, send them to the global storage
     unsafe {WAKEUP_SOURCE = WakeSource::SysTick};
 }
-
-// interrupt!(SPI1, spi_interrupt);
-// fn spi_interrupt() {
-//     unsafe {WAKEUP_SOURCE = WakeSource::SpiRxComplete};
-// }
 
 // TODO: figure out the correct irq source for this one
 interrupt!(EXTI0, rts_edge);
