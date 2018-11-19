@@ -55,7 +55,7 @@ fn main() -> ! {
     // TODO - track "last CDI data" instead
     // that way we can deal with things like custom acceleration or messages handled by this device
     // without spamming the console
-    let mut last_snes_data = 0xff as u16;
+    let mut last_snes_data = SnesState::all();
 
     // enable peripheral clocks
     rcc.apb2enr.modify(|_, w| w
@@ -116,6 +116,7 @@ fn main() -> ! {
     exti.imr.modify(|_, w| w.mr7().bit(true));
     // enable rising edge irq for exti7
     exti.rtsr.modify(|_, w| w.tr7().bit(true));
+    // enable falling edge irq for exti7
     exti.ftsr.modify(|_, w| w.tr7().bit(true));
 
     // enable the uart transmit
@@ -135,6 +136,12 @@ fn main() -> ! {
     // enable exti7 in nvic
     nvic.enable(stm32f103::Interrupt::EXTI9_5);
 
+    // TODO:
+    // I'm still not quite obeying the spec here - as soon as RTS falls, I should avoid sending
+    // another byte until it rises and I can send my controller identification. If we're in the
+    // middle of transmitting a packet, we'll potentially still send another two bytes.
+    //
+    // I'm not going to worry about it for now.
     loop {
         if unsafe {WAKEUP_SOURCE == WakeSource::CdiRts} {
             // did we see rts falling edge? if so, we need to shut up until it goes high
@@ -149,19 +156,22 @@ fn main() -> ! {
             // refresh snes data
             let new_snes_data = fetch_snes_controller_state(&mut spi, &mut gpio_b);
 
-            // transmit a full data packet iff the snes data changed
-            if last_snes_data != new_snes_data {
-                last_snes_data = new_snes_data;
+            // transmit a full data packet if the snes data changed or we're holding a direction
+            // the spec requests continuous packets when the device is out of center position
+            if (last_snes_data != new_snes_data) ||
+                new_snes_data.intersects(SnesState::Up | SnesState::Down |
+                                         SnesState::Left | SnesState::Right) {
                 // transmit packet here
-                tx_controller_state(last_snes_data, &mut uart);
+                tx_controller_state(new_snes_data, &mut uart);
             }
+            last_snes_data = new_snes_data;
         }
         cortex_m::asm::wfi();
     }
 }
 
 // TODO - rework to take a closure for strobing?
-fn fetch_snes_controller_state(spi: &mut stm32f103::SPI1, gpio: &mut stm32f103::GPIOB) -> u16 {
+fn fetch_snes_controller_state(spi: &mut stm32f103::SPI1, gpio: &mut stm32f103::GPIOB) -> SnesState {
     // strobe latch line
     gpio.odr.modify(|_, w| w.odr5().bit(true));
     // erm. I don't really want to set up a timer yet.
@@ -173,15 +183,7 @@ fn fetch_snes_controller_state(spi: &mut stm32f103::SPI1, gpio: &mut stm32f103::
     // wait for some fresh rx data
     while spi.sr.read().rxne().bit_is_clear() { }
     // grab the data out of the DR and invert it
-    (!spi.dr.read().dr().bits()) & 0xfff
-}
-
-fn nybble_to_hex(nybble: u16) -> u16 {
-    if nybble > 9 {
-        (nybble + 0x41 - 10) as u16
-    } else {
-        (nybble + 0x30) as u16
-    }
+    SnesState::from_bits_truncate(!spi.dr.read().dr().bits())
 }
 
 fn tx_serial_byte(uart: &mut stm32f103::USART1, byte: u16) {
@@ -193,13 +195,37 @@ fn send_controller_type(uart: &mut stm32f103::USART1) {
     tx_serial_byte(uart, CONTROLLER_TYPE_ID);
 }
 
-fn tx_controller_state(controller_state: u16, uart: &mut stm32f103::USART1) {
-    // TODO: manipulate data for transmit
-    tx_serial_byte(uart, nybble_to_hex((controller_state & 0xf00) >> 8));
-    tx_serial_byte(uart, nybble_to_hex((controller_state & 0xf0) >> 4));
-    tx_serial_byte(uart, nybble_to_hex((controller_state & 0xf) >> 0));
-    tx_serial_byte(uart, 0x0d);
-    tx_serial_byte(uart, 0x0a);
+fn tx_controller_state(controller_state: SnesState, uart: &mut stm32f103::USART1) {
+    let mut button_1 = 0;
+    let mut button_2 = 0;
+    if controller_state.contains(SnesState::Y) {
+        button_1 = 1;
+        button_2 = 1;
+    } else {
+        if controller_state.intersects(SnesState::B | SnesState::X) {
+            button_1 = 1;
+        }
+        if controller_state.contains(SnesState::A) {
+            button_2 = 1;
+        }
+    }
+
+    let mut x = 0;
+    let mut y = 0;
+    if controller_state.contains(SnesState::Right) {
+        x = 1;
+    } else if controller_state.contains(SnesState::Left) {
+        x = 0xff;
+    }
+    if controller_state.contains(SnesState::Up) {
+        y = 0xff;
+    } else if controller_state.contains(SnesState::Down) {
+        y = 0x1;
+    }
+
+    tx_serial_byte(uart, 0x40 | button_1 << 5 | button_2 << 4 | (y & 0xc0) >> 4 | (x & 0xc0) >> 6);
+    tx_serial_byte(uart, x & 0x3f);
+    tx_serial_byte(uart, y & 0x3f);
 }
 
 fn delay_us(us: u16) {
