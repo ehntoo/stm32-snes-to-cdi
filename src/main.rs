@@ -41,14 +41,16 @@ static mut WAKEUP_SOURCE: WakeSource = WakeSource::NoWake;
 
 #[entry]
 fn main() -> ! {
-    let p = cortex_m::Peripherals::take().unwrap();
-    let f1_p = stm32f103::Peripherals::take().unwrap();
-    let mut syst = p.SYST;
-    let mut uart = f1_p.USART1;
-    let mut spi = f1_p.SPI1;
-    let mut gpio_b = f1_p.GPIOB;
-    let rcc = f1_p.RCC;
-    let afio = f1_p.AFIO;
+    let cp = stm32f103::CorePeripherals::take().unwrap();
+    let p = stm32f103::Peripherals::take().unwrap();
+    let mut syst = cp.SYST;
+    let mut uart = p.USART1;
+    let mut spi = p.SPI1;
+    let mut gpio_b = p.GPIOB;
+    let rcc = p.RCC;
+    let exti = p.EXTI;
+    let afio = p.AFIO;
+    let mut nvic = cp.NVIC;
 
     // TODO - track "last CDI data" instead
     // that way we can deal with things like custom acceleration or messages handled by this device
@@ -78,9 +80,11 @@ fn main() -> ! {
                           .cnf6().bits(0b10)
                           .mode6().bits(0b11)
 
-                          // set PB4 (data) as input
+                          // set PB4 (data) and PB7 (rts) as input
                           .cnf4().bits(0b01)
                           .mode4().bits(0b00)
+                          .cnf7().bits(0b01)
+                          .mode7().bits(0b00)
 
                           // set pb5 (latch) as 2MHz push-pull output
                           .cnf5().bits(0b00)
@@ -103,14 +107,20 @@ fn main() -> ! {
                       .spe().bit(true)
                       .cpol().bit(true)
                       .cpha().bit(false));
+
+        // set exti7 as port b interrupt
+        afio.exticr2.modify(|_, w| w.exti7().bits(0b001));
     }
+
+    // unmask exti7
+    exti.imr.modify(|_, w| w.mr7().bit(true));
+    // enable rising edge irq for exti7
+    exti.rtsr.modify(|_, w| w.tr7().bit(true));
 
     // enable the uart transmit
     uart.cr1.write(|w| w
                    .ue().bit(true)
                    .te().bit(true));
-
-    // TODO configure falling edge interrupt on RTS
 
     send_controller_type(&mut uart);
 
@@ -121,8 +131,12 @@ fn main() -> ! {
     syst.enable_counter();
     syst.enable_interrupt();
 
+    // enable exti7 in nvic
+    nvic.enable(stm32f103::Interrupt::EXTI9_5);
+
     loop {
         if unsafe {WAKEUP_SOURCE == WakeSource::CdiRts} {
+            exti.pr.write(|w| w.pr7().bit(true));
             send_controller_type(&mut uart);
         } else {
             // refresh snes data
@@ -194,9 +208,12 @@ fn SysTick() {
     unsafe {WAKEUP_SOURCE = WakeSource::SysTick};
 }
 
-// TODO: figure out the correct irq source for this one
-interrupt!(EXTI0, rts_edge);
+interrupt!(EXTI9_5, rts_edge);
 fn rts_edge() {
     // the CDI is asking us to identify ourselves
-    unsafe {WAKEUP_SOURCE = WakeSource::CdiRts};
+    unsafe {
+        WAKEUP_SOURCE = WakeSource::CdiRts;
+        // TODO: this is not particularly pretty.
+        (*stm32f103::EXTI::ptr()).pr.write(|w| w.pr7().bit(true)) ;
+    }
 }
