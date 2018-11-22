@@ -38,6 +38,7 @@ fn main() -> ! {
     let mut nvic = cp.NVIC;
     let mut uart = p.USART1;
     let mut spi = p.SPI1;
+    let gpio_a = p.GPIOA;
     let gpio_b = p.GPIOB;
     let rcc = p.RCC;
     let exti = p.EXTI;
@@ -60,6 +61,7 @@ fn main() -> ! {
     // enable peripheral clocks
     rcc.apb2enr.modify(|_, w| w
                        .iopben().bit(true)
+                       .iopaen().bit(true)
                        .spi1en().bit(true)
                        .afioen().bit(true)
                        .usart1en().bit(true));
@@ -67,7 +69,7 @@ fn main() -> ! {
     unsafe {
         afio.mapr.modify(|_, w| w
                         // Remap (TX/PB6, RX/PB7)
-                        .usart1_remap().bit(true)
+                        // .usart1_remap().bit(true)
                         // disable jtag (but not swd) so we can use spi remap
                         .swj_cfg().bits(0b010)
                         // Remap (NSS/PA15, SCK/PB3, MISO/PB4, MOSI/PB5)
@@ -79,7 +81,9 @@ fn main() -> ! {
                           .mode3().bits(0b11)
                           // set PB6 (uart tx) as 50 mhz open-drain af output
                           // this will require a pull-up to 5v
-                          .cnf6().bits(0b11)
+                          // .cnf6().bits(0b11)
+                          // .mode6().bits(0b11)
+                          .cnf6().bits(0b01)
                           .mode6().bits(0b11)
 
                           // set PB4 (data) and PB7 (rts) as input
@@ -91,6 +95,17 @@ fn main() -> ! {
                           // set pb5 (latch) as 2MHz push-pull output
                           .cnf5().bits(0b00)
                           .mode5().bits(0b11));
+
+        gpio_a.crh.modify(|_, w| w
+                          // unremapped tx
+                          .cnf9().bits(0b10)
+                          .mode9().bits(0b11)
+                          .cnf10().bits(0b01)
+                          .mode10().bits(0b00));
+                          
+                          // // rts
+                          // .cnf15().bits(0b01)
+                          // .mode15().bits(0b00));
 
         // want USARTDIV to be 52.08 = 8mhz/16/9600
         // fraction is in 16ths, so 52.0625 is what we end up with
@@ -118,7 +133,25 @@ fn main() -> ! {
 
         // set exti7 as port b interrupt
         afio.exticr2.modify(|_, w| w.exti7().bits(0b001));
+        // set exti9 as port a interrupt
+        // tx on port a
+        afio.exticr3.modify(|_, w| w.exti10().bits(0b000));
+        // rts
+        // afio.exticr4.modify(|_, w| w.exti15().bits(0b000));
     }
+
+    // // unmask exti7
+    // exti.imr.modify(|_, w| w.mr7().bit(true));
+    // // enable rising edge irq for exti7
+    // exti.rtsr.modify(|_, w| w.tr7().bit(true));
+    // // enable falling edge irq for exti7
+    // exti.ftsr.modify(|_, w| w.tr7().bit(true));
+    // unmask exti10
+    exti.imr.modify(|_, w| w.mr10().bit(true));
+    // enable rising edge irq for exti10
+    exti.rtsr.modify(|_, w| w.tr10().bit(true));
+    // enable falling edge irq for exti10
+    exti.ftsr.modify(|_, w| w.tr10().bit(true));
 
     // unmask exti7
     exti.imr.modify(|_, w| w.mr7().bit(true));
@@ -145,6 +178,7 @@ fn main() -> ! {
 
     // enable exti7 in nvic
     nvic.enable(stm32f103::Interrupt::EXTI9_5);
+    nvic.enable(stm32f103::Interrupt::EXTI15_10);
 
     loop {
         // did we see rts falling edge? if so, we need to shut up until it goes high
@@ -277,5 +311,18 @@ fn rts_edge() {
     unsafe {
         // TODO: this is not particularly pretty.
         (*stm32f103::EXTI::ptr()).pr.write(|w| w.pr7().bit(true));
+    }
+}
+
+interrupt!(EXTI15_10, serial_edge);
+fn serial_edge() {
+    unsafe {
+        // TODO: this is not particularly pretty.
+        (*stm32f103::EXTI::ptr()).pr.write(|w| w.pr10().bit(true));
+
+        // I'm using a dangling output pin and this irq to act as an inverter.
+        // don't panic.
+        let pin_state = (*stm32f103::GPIOA::ptr()).idr.read().idr10().bit();
+        (*stm32f103::GPIOB::ptr()).odr.modify(|_, w| w.odr6().bit(!pin_state));
     }
 }
