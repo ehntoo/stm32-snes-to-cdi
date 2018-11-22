@@ -4,10 +4,10 @@
 extern crate panic_halt;
 extern crate stm32f1;
 
-use cortex_m_rt::{entry, exception};
 use cortex_m::peripheral::syst::SystClkSource;
-use stm32f1::stm32f103;
+use cortex_m_rt::{entry, exception};
 use stm32f1::interrupt;
+use stm32f1::stm32f103;
 
 #[macro_use]
 extern crate bitflags;
@@ -30,27 +30,27 @@ bitflags! {
 
 const CONTROLLER_TYPE_ID: u16 = 0x4a;
 
-#[derive(PartialEq)]
-enum WakeSource {
-    NoWake,
-    SysTick,
-    CdiRts,
-}
-
-static mut WAKEUP_SOURCE: WakeSource = WakeSource::NoWake;
-
 #[entry]
 fn main() -> ! {
     let cp = stm32f103::CorePeripherals::take().unwrap();
     let p = stm32f103::Peripherals::take().unwrap();
     let mut syst = cp.SYST;
+    let mut nvic = cp.NVIC;
     let mut uart = p.USART1;
     let mut spi = p.SPI1;
-    let mut gpio_b = p.GPIOB;
+    let gpio_b = p.GPIOB;
     let rcc = p.RCC;
     let exti = p.EXTI;
     let afio = p.AFIO;
-    let mut nvic = cp.NVIC;
+
+    let rts_is_negated = || gpio_b.idr.read().idr7().bit_is_clear();
+    let pulse_strobe = || {
+        // strobe latch line
+        gpio_b.odr.modify(|_, w| w.odr5().bit(true));
+        // erm. I don't really want to set up a timer yet.
+        delay_us(12);
+        gpio_b.odr.modify(|_, w| w.odr5().bit(false));
+    };
 
     // TODO - track "last CDI data" instead
     // that way we can deal with things like custom acceleration or messages handled by this device
@@ -74,10 +74,12 @@ fn main() -> ! {
                         .spi1_remap().bit(true));
 
         gpio_b.crl.modify(|_, w| w
-                          // set PB3 (clock) and PB6 (uart tx) as 2MHz push-pull AF outputs
+                          // set PB3 (clock) as 50MHz push-pull AF outputs
                           .cnf3().bits(0b10)
                           .mode3().bits(0b11)
-                          .cnf6().bits(0b10)
+                          // set PB6 (uart tx) as 50 mhz open-drain af output
+                          // this will require a pull-up to 5v
+                          .cnf6().bits(0b11)
                           .mode6().bits(0b11)
 
                           // set PB4 (data) and PB7 (rts) as input
@@ -123,14 +125,14 @@ fn main() -> ! {
     // enable rising edge irq for exti7
     exti.rtsr.modify(|_, w| w.tr7().bit(true));
     // enable falling edge irq for exti7
-    // exti.ftsr.modify(|_, w| w.tr7().bit(true));
+    exti.ftsr.modify(|_, w| w.tr7().bit(true));
 
     // enable the uart transmit
     uart.cr1.write(|w| w
                    .ue().bit(true)
                    .te().bit(true));
 
-    while gpio_b.idr.read().idr7().bit_is_clear() {}
+    while rts_is_negated() {}
     delay_ms(150);
     send_controller_type(&mut uart);
 
@@ -144,61 +146,55 @@ fn main() -> ! {
     // enable exti7 in nvic
     nvic.enable(stm32f103::Interrupt::EXTI9_5);
 
-    // TODO:
-    // I'm still not quite obeying the spec here - as soon as RTS falls, I should avoid sending
-    // another byte until it rises and I can send my controller identification. If we're in the
-    // middle of transmitting a packet, we'll potentially still send another two bytes.
-    //
-    // I'm not going to worry about it for now.
     loop {
-        // if unsafe {WAKEUP_SOURCE == WakeSource::CdiRts} {
-            // did we see rts falling edge? if so, we need to shut up until it goes high
-            if gpio_b.idr.read().idr7().bit_is_clear() {
-                // wait for a rising edge
-                // syst.disable_interrupt();
-                while gpio_b.idr.read().idr7().bit_is_clear() {
-                    cortex_m::asm::wfi();
-                }
-
-                send_controller_type(&mut uart);
-                // syst.enable_interrupt();
-            // }
-        } else {
-            // refresh snes data
-            let new_snes_data = fetch_snes_controller_state(&mut spi, &mut gpio_b);
-
-            // transmit a full data packet if the snes data changed or we're holding a direction
-            // the spec requests continuous packets when the device is out of center position
-            if (last_snes_data != new_snes_data) ||
-                new_snes_data.intersects(SnesState::Up | SnesState::Down |
-                                         SnesState::Left | SnesState::Right) {
-                // transmit packet here
-                tx_controller_state(new_snes_data, &mut uart, &mut gpio_b);
+        // did we see rts falling edge? if so, we need to shut up until it goes high
+        if rts_is_negated() {
+            // wait for a rising edge
+            while rts_is_negated() {
+                cortex_m::asm::wfi();
             }
-            last_snes_data = new_snes_data;
+
+            send_controller_type(&mut uart);
         }
+
+        // refresh snes data
+        let new_snes_data = fetch_snes_controller_state(&mut spi, pulse_strobe);
+
+        // transmit a full data packet if the snes data changed or we're holding a direction
+        // the spec requests continuous packets when the device is out of center position
+        if (last_snes_data != new_snes_data)
+            || new_snes_data
+                .intersects(SnesState::Up | SnesState::Down | SnesState::Left | SnesState::Right)
+        {
+            // transmit packet here
+            tx_controller_state(new_snes_data, &mut uart, rts_is_negated);
+        }
+        last_snes_data = new_snes_data;
+
         cortex_m::asm::wfi();
     }
 }
 
-// TODO - rework to take a closure for strobing?
-fn fetch_snes_controller_state(spi: &mut stm32f103::SPI1, gpio: &mut stm32f103::GPIOB) -> SnesState {
-    // strobe latch line
-    gpio.odr.modify(|_, w| w.odr5().bit(true));
-    // erm. I don't really want to set up a timer yet.
-    delay_us(12);
-    gpio.odr.modify(|_, w| w.odr5().bit(false));
+fn fetch_snes_controller_state<F>(spi: &mut stm32f103::SPI1, pulse_strobe: F) -> SnesState
+where
+    F: Fn(),
+{
+    pulse_strobe();
 
     // write a nonsense byte to tx to trigger a transfer
-    unsafe { spi.dr.write(|w| w.dr().bits(0x55aa)); }
+    unsafe {
+        spi.dr.write(|w| w.dr().bits(0x55aa));
+    }
     // wait for some fresh rx data
-    while spi.sr.read().rxne().bit_is_clear() { }
+    while spi.sr.read().rxne().bit_is_clear() {}
     // grab the data out of the DR and invert it
     SnesState::from_bits_truncate(!spi.dr.read().dr().bits())
 }
 
 fn tx_serial_byte(uart: &mut stm32f103::USART1, byte: u16) {
-    unsafe { uart.dr.write(|w| w.dr().bits(byte | 0x80)); }
+    unsafe {
+        uart.dr.write(|w| w.dr().bits(byte | 0x80));
+    }
     while uart.sr.read().txe().bit_is_clear() {}
 }
 
@@ -206,7 +202,13 @@ fn send_controller_type(uart: &mut stm32f103::USART1) {
     tx_serial_byte(uart, CONTROLLER_TYPE_ID);
 }
 
-fn tx_controller_state(controller_state: SnesState, uart: &mut stm32f103::USART1, gpio: &mut stm32f103::GPIOB) {
+fn tx_controller_state<F>(
+    controller_state: SnesState,
+    uart: &mut stm32f103::USART1,
+    rts_is_negated: F,
+) where
+    F: Fn() -> bool,
+{
     let mut button_1 = 0;
     let mut button_2 = 0;
     if controller_state.contains(SnesState::Y) {
@@ -221,26 +223,32 @@ fn tx_controller_state(controller_state: SnesState, uart: &mut stm32f103::USART1
         }
     }
 
-    let mut x = 0;
-    let mut y = 0;
-    if controller_state.contains(SnesState::Right) {
-        x = 1;
+    let x = if controller_state.contains(SnesState::Right) {
+        0x1
     } else if controller_state.contains(SnesState::Left) {
-        x = 0xff;
-    }
-    if controller_state.contains(SnesState::Up) {
-        y = 0xff;
-    } else if controller_state.contains(SnesState::Down) {
-        y = 0x1;
-    }
+        0xff
+    } else {
+        0
+    };
 
-    tx_serial_byte(uart, 0x40 | button_1 << 5 | button_2 << 4 | (y & 0xc0) >> 4 | (x & 0xc0) >> 6);
-    if gpio.idr.read().idr7().bit_is_clear() {
-        return
+    let y = if controller_state.contains(SnesState::Up) {
+        0xff
+    } else if controller_state.contains(SnesState::Down) {
+        0x1
+    } else {
+        0
+    };
+
+    tx_serial_byte(
+        uart,
+        0x40 | button_1 << 5 | button_2 << 4 | (y & 0xc0) >> 4 | (x & 0xc0) >> 6,
+    );
+    if rts_is_negated() {
+        return;
     }
     tx_serial_byte(uart, x & 0x3f);
-    if gpio.idr.read().idr7().bit_is_clear() {
-        return
+    if rts_is_negated() {
+        return;
     }
     tx_serial_byte(uart, y & 0x3f);
 }
@@ -262,15 +270,12 @@ fn delay_ms(ms: u32) {
 #[exception]
 fn SysTick() {
     // wake up to grab the latest SNES inputs, send them to the global storage
-    unsafe {WAKEUP_SOURCE = WakeSource::SysTick};
 }
 
 interrupt!(EXTI9_5, rts_edge);
 fn rts_edge() {
-    // the CDI is asking us to identify ourselves
     unsafe {
-        WAKEUP_SOURCE = WakeSource::CdiRts;
         // TODO: this is not particularly pretty.
-        (*stm32f103::EXTI::ptr()).pr.write(|w| w.pr7().bit(true)) ;
+        (*stm32f103::EXTI::ptr()).pr.write(|w| w.pr7().bit(true));
     }
 }
