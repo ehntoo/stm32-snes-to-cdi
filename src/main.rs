@@ -95,6 +95,12 @@ fn main() -> ! {
         uart.brr.write(|w| w
                        .div_mantissa().bits(52)
                        .div_fraction().bits(1));
+        // okay, let's try 1200
+        // want USARTDIV to be 416.6666 = 8mhz/16/1200
+        // fraction is in 16ths, so 416.6875 is what we end up with
+        // uart.brr.write(|w| w
+        //                .div_mantissa().bits(416)
+        //                .div_fraction().bits(11));
 
         spi.cr1.modify(|_, w| w
                       // pclk/128 -> 8mhz/128 ~= 62.5kHz
@@ -117,19 +123,21 @@ fn main() -> ! {
     // enable rising edge irq for exti7
     exti.rtsr.modify(|_, w| w.tr7().bit(true));
     // enable falling edge irq for exti7
-    exti.ftsr.modify(|_, w| w.tr7().bit(true));
+    // exti.ftsr.modify(|_, w| w.tr7().bit(true));
 
     // enable the uart transmit
     uart.cr1.write(|w| w
                    .ue().bit(true)
                    .te().bit(true));
 
+    while gpio_b.idr.read().idr7().bit_is_clear() {}
+    delay_ms(150);
     send_controller_type(&mut uart);
 
     syst.set_clock_source(SystClkSource::Core);
     // configures the system timer to trigger a SysTick exception at 1khz
     // core clock = 8 mhz
-    syst.set_reload(8_000_000 / 1000);
+    syst.set_reload(8_000_000 / 100);
     syst.enable_counter();
     syst.enable_interrupt();
 
@@ -143,15 +151,18 @@ fn main() -> ! {
     //
     // I'm not going to worry about it for now.
     loop {
-        if unsafe {WAKEUP_SOURCE == WakeSource::CdiRts} {
+        // if unsafe {WAKEUP_SOURCE == WakeSource::CdiRts} {
             // did we see rts falling edge? if so, we need to shut up until it goes high
             if gpio_b.idr.read().idr7().bit_is_clear() {
                 // wait for a rising edge
-                syst.disable_interrupt();
-                cortex_m::asm::wfi();
-            }
-            send_controller_type(&mut uart);
-            syst.enable_interrupt();
+                // syst.disable_interrupt();
+                while gpio_b.idr.read().idr7().bit_is_clear() {
+                    cortex_m::asm::wfi();
+                }
+
+                send_controller_type(&mut uart);
+                // syst.enable_interrupt();
+            // }
         } else {
             // refresh snes data
             let new_snes_data = fetch_snes_controller_state(&mut spi, &mut gpio_b);
@@ -162,7 +173,7 @@ fn main() -> ! {
                 new_snes_data.intersects(SnesState::Up | SnesState::Down |
                                          SnesState::Left | SnesState::Right) {
                 // transmit packet here
-                tx_controller_state(new_snes_data, &mut uart);
+                tx_controller_state(new_snes_data, &mut uart, &mut gpio_b);
             }
             last_snes_data = new_snes_data;
         }
@@ -187,7 +198,7 @@ fn fetch_snes_controller_state(spi: &mut stm32f103::SPI1, gpio: &mut stm32f103::
 }
 
 fn tx_serial_byte(uart: &mut stm32f103::USART1, byte: u16) {
-    unsafe { uart.dr.write(|w| w.dr().bits(byte)); }
+    unsafe { uart.dr.write(|w| w.dr().bits(byte | 0x80)); }
     while uart.sr.read().txe().bit_is_clear() {}
 }
 
@@ -195,7 +206,7 @@ fn send_controller_type(uart: &mut stm32f103::USART1) {
     tx_serial_byte(uart, CONTROLLER_TYPE_ID);
 }
 
-fn tx_controller_state(controller_state: SnesState, uart: &mut stm32f103::USART1) {
+fn tx_controller_state(controller_state: SnesState, uart: &mut stm32f103::USART1, gpio: &mut stm32f103::GPIOB) {
     let mut button_1 = 0;
     let mut button_2 = 0;
     if controller_state.contains(SnesState::Y) {
@@ -224,13 +235,26 @@ fn tx_controller_state(controller_state: SnesState, uart: &mut stm32f103::USART1
     }
 
     tx_serial_byte(uart, 0x40 | button_1 << 5 | button_2 << 4 | (y & 0xc0) >> 4 | (x & 0xc0) >> 6);
+    if gpio.idr.read().idr7().bit_is_clear() {
+        return
+    }
     tx_serial_byte(uart, x & 0x3f);
+    if gpio.idr.read().idr7().bit_is_clear() {
+        return
+    }
     tx_serial_byte(uart, y & 0x3f);
 }
 
 fn delay_us(us: u16) {
     // this works out about right at 8mhz in release mode
     for _ in 0..(3 * us / 2) {
+        cortex_m::asm::nop()
+    }
+}
+
+fn delay_ms(ms: u32) {
+    // this works out about right at 8mhz in release mode
+    for _ in 0..(1000 * ms) {
         cortex_m::asm::nop()
     }
 }
