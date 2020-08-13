@@ -1,3 +1,52 @@
+/*
+ * SNES to CD-i Controller Adapter
+ *
+ * Use any old SNES controller as a joypad on your CD-i console using just an STM32F103 "blue pill"
+ * development board.
+ *
+ * This could stand to be updated to reflect newer Rust practices, having been written in 2018
+ * before stabilization of async, and before a whole lot of API development for embedded crates.
+ *
+ * The method to achieve low-idle serial signalling is... hackish, using an interrupt to invert the
+ * output of a hardware UART peripheral, but the UART in the STM32F103 does not have a negated
+ * signalling mode and this avoids use of any additional hardware.
+ *
+ * Hook up your SNES controller as follows:
+ * SNES Controller:
+ * ----------------------------------------------------------------------------
+ * ASCII Art borrowed from
+ * https://steckschwein.de/2020/01/15/connecting-snes-controller-to-the-steckschwein/
+ *
+ *  /---------------------
+ * | 7  6  5 | 4  3  2  1 |
+ *  \---------------------
+ * 
+ * Pin Description
+ * 1   +5V
+ * 2  CLK
+ * 3  LATCH
+ * 4  DATA
+ * 5  –
+ * 6  –
+ * 7  GND
+ *
+ * STM32 connections:
+ * PB3 - Clock
+ * PB4 - Data
+ * PB5 - Latch
+ * Ground
+ * +5v to Controller
+ *
+ * CD-i
+ * ----------------------------------------------------------------------------
+ * http://www.icdia.co.uk/cdprosupport/hardware/cables/cdi_ser.htm
+ * https://cdii.blogspot.com/2019/08/the-8-pin-din-on-cd-i-player-is.html
+ * CD-i      STM32
+ * 2/RX   -  PB6
+ * 5/GND  -  Ground
+ * 7/RTS  -  PB7
+ * 8/+5V  -  5V supply
+ */
 #![no_std]
 #![no_main]
 
@@ -68,8 +117,6 @@ fn main() -> ! {
 
     unsafe {
         afio.mapr.modify(|_, w| w
-                        // Remap (TX/PB6, RX/PB7)
-                        // .usart1_remap().bit(true)
                         // disable jtag (but not swd) so we can use spi remap
                         .swj_cfg().bits(0b010)
                         // Remap (NSS/PA15, SCK/PB3, MISO/PB4, MOSI/PB5)
@@ -79,10 +126,8 @@ fn main() -> ! {
                           // set PB3 (clock) as 50MHz push-pull AF outputs
                           .cnf3().bits(0b10)
                           .mode3().bits(0b11)
-                          // set PB6 (uart tx) as 50 mhz open-drain af output
+                          // set PB6 (uart tx) as 50 mhz open-drain gp output
                           // this will require a pull-up to 5v
-                          // .cnf6().bits(0b11)
-                          // .mode6().bits(0b11)
                           .cnf6().bits(0b01)
                           .mode6().bits(0b11)
 
@@ -97,27 +142,17 @@ fn main() -> ! {
                           .mode5().bits(0b11));
 
         gpio_a.crh.modify(|_, w| w
-                          // unremapped tx
+                          // unremapped tx/rx for uart1 to trigger EXTI interrupt
                           .cnf9().bits(0b10)
                           .mode9().bits(0b11)
                           .cnf10().bits(0b01)
                           .mode10().bits(0b00));
                           
-                          // // rts
-                          // .cnf15().bits(0b01)
-                          // .mode15().bits(0b00));
-
         // want USARTDIV to be 52.08 = 8mhz/16/9600
         // fraction is in 16ths, so 52.0625 is what we end up with
         uart.brr.write(|w| w
                        .div_mantissa().bits(52)
                        .div_fraction().bits(1));
-        // okay, let's try 1200
-        // want USARTDIV to be 416.6666 = 8mhz/16/1200
-        // fraction is in 16ths, so 416.6875 is what we end up with
-        // uart.brr.write(|w| w
-        //                .div_mantissa().bits(416)
-        //                .div_fraction().bits(11));
 
         spi.cr1.modify(|_, w| w
                       // pclk/128 -> 8mhz/128 ~= 62.5kHz
@@ -136,24 +171,16 @@ fn main() -> ! {
         // set exti9 as port a interrupt
         // tx on port a
         afio.exticr3.modify(|_, w| w.exti10().bits(0b000));
-        // rts
-        // afio.exticr4.modify(|_, w| w.exti15().bits(0b000));
     }
 
-    // // unmask exti7
-    // exti.imr.modify(|_, w| w.mr7().bit(true));
-    // // enable rising edge irq for exti7
-    // exti.rtsr.modify(|_, w| w.tr7().bit(true));
-    // // enable falling edge irq for exti7
-    // exti.ftsr.modify(|_, w| w.tr7().bit(true));
-    // unmask exti10
+    // unmask exti10 to "receive" our outgoing serial signals for inversion
     exti.imr.modify(|_, w| w.mr10().bit(true));
     // enable rising edge irq for exti10
     exti.rtsr.modify(|_, w| w.tr10().bit(true));
     // enable falling edge irq for exti10
     exti.ftsr.modify(|_, w| w.tr10().bit(true));
 
-    // unmask exti7
+    // unmask exti7 to receive interrupts for RTS inputs
     exti.imr.modify(|_, w| w.mr7().bit(true));
     // enable rising edge irq for exti7
     exti.rtsr.modify(|_, w| w.tr7().bit(true));
